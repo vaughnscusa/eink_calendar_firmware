@@ -1,15 +1,15 @@
-// TEST SKETCH — confirms wiring + panel work, no WiFi/server needed.
+// E-ink calendar firmware (ESP32 + Waveshare 7.5" 800x480 B/W)
 //
-// How to use:
-//   1. Temporarily rename your real src/main.cpp to src/main.cpp.bak
-//   2. Rename this file from main_test_pattern.cpp to main.cpp
-//   3. Build + upload
-//   4. Once you see text/shapes on the panel, swap the files back
-//      (restore the real main.cpp) before moving on to the fetch firmware.
+// On each wake: connect to WiFi, fetch the pre-rendered 1-bit frame from the
+// backend (IMAGE_URL in config.h), redraw the panel only if it changed (ETag),
+// then deep-sleep for REFRESH_INTERVAL_MINUTES.
 
 #include <Arduino.h>
 #include <SPI.h>
 #include <GxEPD2_BW.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include "config.h"
 
 #define PIN_BUSY 25
 #define PIN_RST  26
@@ -18,41 +18,71 @@
 #define PIN_SCK  13
 #define PIN_MOSI 14
 
-// If the screen stays blank after upload, try GxEPD2_750 instead of
-// GxEPD2_750_T7 here (V1 vs V2 panel controller).
-GxEPD2_BW<GxEPD2_750_T7, GxEPD2_750_T7::HEIGHT> display(
-    GxEPD2_750_T7(PIN_CS, PIN_DC, PIN_RST, PIN_BUSY));
+GxEPD2_BW<GxEPD2_750_T7, GxEPD2_750_T7::HEIGHT / 8> display(
+  GxEPD2_750_T7(PIN_CS, PIN_DC, PIN_RST, PIN_BUSY));
+
+static const size_t IMG_BYTES = 800 * 480 / 8;   // 48,000
+static uint8_t imgBuf[IMG_BYTES];
+RTC_DATA_ATTR char lastEtag[40] = "";            // survives deep sleep
+
+bool connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) delay(250);
+  Serial.println(WiFi.status() == WL_CONNECTED ? "WiFi connected" : "WiFi failed");
+  return WiFi.status() == WL_CONNECTED;
+}
+
+// 1 = new image downloaded, 0 = unchanged, -1 = error
+int fetchFrame() {
+  HTTPClient http;
+  http.begin(IMAGE_URL);
+  http.setTimeout(15000);
+  const char* keys[] = {"ETag"};
+  http.collectHeaders(keys, 1);
+  if (lastEtag[0]) http.addHeader("If-None-Match", lastEtag);
+
+  int code = http.GET();
+  if (code == 304) { http.end(); return 0; }
+  if (code != 200) { Serial.printf("HTTP error %d\n", code); http.end(); return -1; }
+  if (http.getSize() != (int)IMG_BYTES) {
+    Serial.printf("Unexpected size %d\n", http.getSize());
+    http.end(); return -1;
+  }
+
+  WiFiClient* s = http.getStreamPtr();
+  size_t got = 0;
+  uint32_t t0 = millis();
+  while (got < IMG_BYTES && millis() - t0 < 20000) {
+    got += s->readBytes(imgBuf + got, IMG_BYTES - got);
+  }
+  String etag = http.header("ETag");
+  http.end();
+
+  if (got != IMG_BYTES) { Serial.println("Short read"); return -1; }
+  strlcpy(lastEtag, etag.c_str(), sizeof(lastEtag));
+  return 1;
+}
 
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("Test pattern starting...");
 
-  SPI.begin(13, 12, 14, 15); // SCK, MISO, MOSI, CS 
+  if (connectWiFi()) {
+    int r = fetchFrame();
+    Serial.printf("fetch result: %d\n", r);
+    if (r == 1) {
+      SPI.begin(PIN_SCK, 12, PIN_MOSI, PIN_CS);   // SCK, MISO, MOSI, CS
+      display.init(115200);
+      display.drawImage(imgBuf, 0, 0, 800, 480);   // 1 = white, 0 = black
+      display.hibernate();
+    }
+  }
 
-  display.init(115200);
-
-  display.setFullWindow();
-  display.firstPage();
-  do {
-    display.fillScreen(GxEPD_WHITE);
-
-    // A few shapes so you can confirm orientation + that drawing works
-    display.drawRect(10, 10, 200, 100, GxEPD_BLACK);
-    display.fillRect(230, 10, 200, 100, GxEPD_BLACK);
-    display.drawLine(0, 150, 799, 150, GxEPD_BLACK);
-    display.drawCircle(400, 300, 80, GxEPD_BLACK);
-
-    // Text
-    display.setCursor(10, 400);
-    display.setTextColor(GxEPD_BLACK);
-    display.setTextSize(3);
-    display.print("E-ink is alive!");
-  } while (display.nextPage());
-
-  Serial.println("Test pattern drawn. Check the panel.");
+  WiFi.disconnect(true);
+  esp_sleep_enable_timer_wakeup(REFRESH_INTERVAL_MINUTES * 60ULL * 1000000ULL);
+  esp_deep_sleep_start();
 }
 
-void loop() {
-  // nothing to do
-}
+void loop() {}
